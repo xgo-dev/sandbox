@@ -1,0 +1,23 @@
+package sandboxdriver
+
+import (
+	"flag"
+	"os"
+	"regexp"
+	"testing"
+	"testing/internal/testdeps"
+)
+
+// Run constructs testing's state in the guest. The host's testing.T and M
+// contain process resources and are not part of the transferred closure.
+func Run(test testing.InternalTest) int {
+	if err := os.Setenv("TMPDIR", "/tmp"); err != nil {
+		panic(err)
+	}
+	testdeps.ImportPath = "reflect"
+	m := testing.MainStart(testdeps.TestDeps{}, []testing.InternalTest{test}, nil, nil, nil)
+	if err := flag.CommandLine.Parse([]string{"-test.v", "-test.run=^" + regexp.QuoteMeta(test.Name) + "$", "-test.timeout=2m"}); err != nil {
+		panic(err)
+	}
+	return m.Run()
+}

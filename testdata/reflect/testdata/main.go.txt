@@ -1,0 +1,52 @@
+package reflect_test
+
+import (
+	"flag"
+	"fmt"
+	"os"
+	"testing"
+	"testing/sandboxdriver"
+
+	"github.com/xgo-dev/sandbox"
+)
+
+var sandboxReflectCase = flag.String("sandbox-reflect", "", "run one upstream reflect test in Sentry")
+
+var sandboxReflectTests = []testing.InternalTest{
+	// TESTS
+}
+
+func TestMain(m *testing.M) {
+	flag.Parse()
+	if *sandboxReflectCase == "" {
+		os.Exit(m.Run())
+	}
+	for _, test := range sandboxReflectTests {
+		if test.Name != *sandboxReflectCase {
+			continue
+		}
+		code, completed := 1, false
+		s := sandbox.Sandbox{
+			Library: os.Getenv("SANDBOX_TEST_LIBRARY"),
+			Mounts: []sandbox.Mount{
+				{Type: "bind", Source: "/", Target: "/", Options: []string{"ro"}},
+				{Type: "tmpfs", Target: "/tmp"},
+				{Type: "proc", Target: "/proc"},
+			},
+		}
+		if err := s.Run(func() {
+			code = sandboxdriver.Run(test)
+			completed = true
+		}); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		if !completed {
+			fmt.Fprintln(os.Stderr, "guest completion was not written back")
+			os.Exit(1)
+		}
+		os.Exit(code)
+	}
+	fmt.Fprintln(os.Stderr, "unknown upstream reflect test:", *sandboxReflectCase)
+	os.Exit(1)
+}
