@@ -58,6 +58,9 @@ func methodValueStorage(obj reflect.Value) *methodValueImpl {
 }
 
 func makeFuncStorage(obj reflect.Value) *makeFuncImpl {
+	if obj.Pointer() != makeFuncPC {
+		return nil
+	}
 	if _, err := executableNativeMetadata(); err != nil {
 		Failf("MakeFunc metadata: %w", err)
 	}
@@ -72,6 +75,33 @@ func makeFuncStorage(obj reflect.Value) *makeFuncImpl {
 func makeFuncCallback(obj reflect.Value) reflect.Value {
 	impl := makeFuncStorage(obj)
 	return reflect.ValueOf(&impl.fn).Elem()
+}
+
+// reflectxMethod adapts a restored function to SetMethods' local callback ABI.
+// Its receiver retains the original function so a later Save can unwrap it,
+// including when the caller starts a new State for the restored graph.
+type reflectxMethod struct {
+	function reflect.Value
+}
+
+func (m reflectxMethod) call(args []reflect.Value) []reflect.Value {
+	if m.function.Type().IsVariadic() {
+		return m.function.CallSlice(args)
+	}
+	return m.function.Call(args)
+}
+
+var reflectxMethodCallPC = reflect.ValueOf(reflectxMethod{}.call).Pointer()
+
+func (ns *nativeState) originalFunction(obj reflect.Value) reflect.Value {
+	if impl := makeFuncStorage(obj); impl != nil {
+		callback := reflect.ValueOf(impl.fn)
+		if callback.Pointer() == reflectxMethodCallPC {
+			storage := ns.functionStorage(callback)
+			return storage.Field(1).Interface().(reflectxMethod).function
+		}
+	}
+	return obj
 }
 
 func (ns *nativeState) layout(pc uintptr, captureFree bool) reflect.Type {
@@ -93,15 +123,31 @@ func (ns *nativeState) layout(pc uintptr, captureFree bool) reflect.Type {
 	return typ
 }
 
+func (ns *nativeState) functionStorage(obj reflect.Value) reflect.Value {
+	if !obj.CanAddr() {
+		v := reflect.New(obj.Type()).Elem()
+		v.Set(obj)
+		obj = v
+	}
+	storage := *(*unsafe.Pointer)(obj.Addr().UnsafePointer())
+	m, err := executableNativeMetadata()
+	if err != nil {
+		Failf("native closure metadata: %w", err)
+	}
+	addr := uintptr(storage)
+	typ := ns.layout(obj.Pointer(), addr >= m.funcStart && addr < m.funcEnd)
+	return reflect.NewAt(typ, storage).Elem()
+}
+
 func (es *encodeState) encodeFunction(obj reflect.Value, dest *object) {
 	f := &functionValue{}
 	*dest = f
 	if obj.IsNil() {
 		return
 	}
+	obj = es.native.originalFunction(obj)
 	pc := obj.Pointer()
-	if pc == makeFuncPC {
-		impl := makeFuncStorage(obj)
+	if impl := makeFuncStorage(obj); impl != nil {
 		f.PC = uintValue(pc)
 		f.Type = es.findType(nativeReflectType(impl.ftyp))
 		es.resolve(reflect.ValueOf(&impl.fn), &f.Env)
@@ -114,21 +160,10 @@ func (es *encodeState) encodeFunction(obj reflect.Value, dest *object) {
 		runtime.KeepAlive(obj)
 		return
 	}
-	if !obj.CanAddr() {
-		v := reflect.New(obj.Type()).Elem()
-		v.Set(obj)
-		obj = v
-	}
-	storage := *(*unsafe.Pointer)(obj.Addr().UnsafePointer())
-	m, err := executableNativeMetadata()
-	if err != nil {
-		Failf("native closure metadata: %w", err)
-	}
-	addr := uintptr(storage)
-	typ := es.native.layout(pc, addr >= m.funcStart && addr < m.funcEnd)
+	storage := es.native.functionStorage(obj)
 	f.PC = uintValue(pc)
-	if typ.NumField() != 1 {
-		es.resolve(reflect.NewAt(typ, storage), &f.Env)
+	if storage.NumField() != 1 {
+		es.resolve(storage.Addr(), &f.Env)
 	}
 	runtime.KeepAlive(obj)
 }

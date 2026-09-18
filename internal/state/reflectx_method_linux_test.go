@@ -3,6 +3,7 @@
 package state
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"os/exec"
@@ -106,6 +107,11 @@ func TestReflectxMethodGraph(t *testing.T) {
 	if *src.Counter != 3 || src.Number.Number() != 13 {
 		t.Fatal("guest changed source captures")
 	}
+	var next methodRoot
+	roundtrip(t, &dst, &next)
+	if next.Number.Number() != 21 || next.Adder.Add(1) != 18 || *next.Counter != 5 || *dst.Counter != 4 {
+		t.Fatal("fresh state lost the restored method's captures or source isolation")
+	}
 }
 
 func TestReflectxMethodNewProcess(t *testing.T) {
@@ -144,5 +150,156 @@ func TestReflectxMethodNewProcess(t *testing.T) {
 	cmd.Env = append(os.Environ(), imageEnv+"="+path)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("method destination: %v\n%s", err, output)
+	}
+}
+
+type NativeMethodCounter struct{ N int }
+
+func (n *NativeMethodCounter) Add(values ...int) int {
+	for _, value := range values {
+		n.N += value
+	}
+	return n.N
+}
+
+func TestReflectxNativeMethodProcess(t *testing.T) {
+	const imageEnv = "SANDBOX_NATIVE_METHOD_IMAGE"
+	if os.Getenv("SANDBOX_NATIVE_METHOD_SOURCE") != "1" {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestReflectxNativeMethodProcess$", "-test.v")
+		cmd.Env = append(os.Environ(), "SANDBOX_NATIVE_METHOD_SOURCE=1")
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("native method source: %v\n%s", err, output)
+		}
+		return
+	}
+
+	embed := func(receiver any, tag reflect.StructTag) reflect.Value {
+		value := reflect.ValueOf(receiver)
+		typ := reflect.StructOf([]reflect.StructField{{Name: value.Type().Elem().Name(), Type: value.Type(), Anonymous: true, Tag: tag}})
+		result := reflect.New(typ).Elem()
+		result.Field(0).Set(value)
+		return result
+	}
+	ctx := context.Background()
+	var graph State
+	mem := make([]byte, 8<<20)
+	if path := os.Getenv(imageEnv); path != "" {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var guest []reflect.Value
+		if _, err := graph.Load(ctx, data, &guest); err != nil {
+			t.Fatal(err)
+		}
+		runtime.GC()
+		checkMethodRoot(t, guest[3].Interface().(methodRoot))
+		if got := guest[0].Interface().(interface{ String() string }).String(); got != "host" {
+			t.Fatalf("native String method = %q", got)
+		}
+		if got := guest[1].Interface().(methodAdder).Add(2, 5); got != 17 {
+			t.Fatalf("native variadic method = %d", got)
+		}
+		guest[0].MethodByName("WriteString").Call([]reflect.Value{reflect.ValueOf("-guest")})
+		guest[2] = embed(bytes.NewBufferString("created in guest"), `origin:"guest"`)
+		n, _, err := graph.Save(ctx, mem, &guest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		checkOriginalMethodRecords(t, graph.saved, mem[:n])
+		if err := os.WriteFile(path, mem[:n], 0600); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+
+	buffer := bytes.NewBufferString("host")
+	counter := &NativeMethodCounter{N: 10}
+	// Mix native promoted methods with reflectx callbacks, as an interpreter
+	// does when its dynamic types include an embedded bytes.Buffer.
+	host := []reflect.Value{embed(buffer, ""), embed(counter, ""), {}, reflect.ValueOf(methodFixture())}
+	n, _, err := graph.Save(ctx, mem, &host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkOriginalMethodRecords(t, graph.saved, mem[:n])
+	path := filepath.Join(t.TempDir(), "native-methods.state")
+	if err := os.WriteFile(path, mem[:n], 0600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestReflectxNativeMethodProcess$", "-test.v")
+	cmd.Env = append(os.Environ(), imageEnv+"="+path)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("native method destination: %v\n%s", err, output)
+	}
+	if buffer.String() != "host" || counter.N != 10 {
+		t.Fatal("guest changed source receivers before writeback")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := graph.Load(ctx, data, &host); err != nil {
+		t.Fatal(err)
+	}
+	runtime.GC()
+	if buffer.String() != "host-guest" || counter.N != 17 {
+		t.Fatal("returned methods lost their receiver aliases")
+	}
+	if got := host[1].Interface().(methodAdder).Add(3, 4); got != 24 || counter.N != 24 {
+		t.Fatalf("returned variadic method = %d, receiver = %d", got, counter.N)
+	}
+	if got := host[2].Interface().(interface{ String() string }).String(); got != "created in guest" {
+		t.Fatalf("guest-created native String method = %q", got)
+	}
+}
+
+func checkOriginalMethodRecords(t *testing.T, es *encodeState, data []byte) {
+	t.Helper()
+	r := reader{mem: data}
+	for range 2 {
+		n, objects, err := readHeader(&r)
+		if err != nil || objects {
+			t.Fatalf("type table header: objects=%t err=%v", objects, err)
+		}
+		r.readBytes(n)
+	}
+	encoded, err := r.get()
+	if err != nil {
+		t.Fatal(err)
+	}
+	methods, ok := encoded.(*arrayValue)
+	if !ok {
+		t.Fatalf("method table is %T", encoded)
+	}
+	var native, dynamic int
+	for _, record := range methods.Contents {
+		value, ok := record.(*reflectedValue)
+		if !ok || value.Addressable {
+			t.Fatalf("method is not an original function value: %T", record)
+		}
+		fn, ok := value.Value.(*functionValue)
+		if !ok {
+			t.Fatalf("method payload is %T", value.Value)
+		}
+		if uintptr(fn.PC) == makeFuncPC {
+			dynamic++
+		} else {
+			native++
+			if fn.Env.Root != 0 {
+				t.Fatalf("native method acquired a wrapper environment: %v", fn.Env)
+			}
+		}
+	}
+	if native == 0 || dynamic == 0 {
+		t.Fatalf("missing method kind: native=%d dynamic=%d", native, dynamic)
+	}
+	callPC := reflect.ValueOf(reflect.Value{}.Call).Pointer()
+	callSlicePC := reflect.ValueOf(reflect.Value{}.CallSlice).Pointer()
+	for _, obj := range es.pending {
+		pc := es.native.storage[obj.obj.Type()]
+		if pc == reflectxMethodCallPC || pc == callPC || pc == callSlicePC {
+			t.Fatalf("local method adapter entered the object graph: ID %d", obj.id)
+		}
 	}
 }

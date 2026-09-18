@@ -906,7 +906,6 @@ func (es *encodeState) Save(obj reflect.Value) {
 	var oes *objectEncodeState
 	var snapshot *reflecttype.Snapshot
 	var extended *reflectxtype.Snapshot
-	methodRecords := make(map[uintptr]object)
 	var methods arrayValue
 	if err := safely(func() {
 		for {
@@ -921,6 +920,7 @@ func (es *encodeState) Save(obj reflect.Value) {
 			if len(es.reflected) == 0 {
 				break
 			}
+			reflectedCount := len(es.reflected)
 			var err error
 			snapshot, err = reflecttype.Export()
 			if err != nil {
@@ -946,18 +946,12 @@ func (es *encodeState) Save(obj reflect.Value) {
 			}
 			methods.Contents = make([]object, len(extended.Methods))
 			for i, fn := range extended.Methods {
-				callback := makeFuncCallback(fn)
-				address := callback.Addr().Pointer()
-				record, ok := methodRecords[address]
-				if !ok {
-					es.encodeFunction(callback, &record)
-					methodRecords[address] = record
-				}
-				methods.Contents[i] = record
+				fn = es.native.originalFunction(fn)
+				es.encodeObject(reflect.ValueOf(fn), encodeAsValue, &methods.Contents[i])
 			}
-			// Method environments can expose more types and methods. Finish their
-			// objects before assigning the final type IDs for the entire graph.
-			if es.deferred.Front() == nil {
+			// Method signatures and environments can expose more types. Finish
+			// both before assigning the final type IDs for the entire graph.
+			if es.deferred.Front() == nil && len(es.reflected) == reflectedCount {
 				break
 			}
 		}
@@ -1005,7 +999,7 @@ func (es *encodeState) Save(obj reflect.Value) {
 	es.w.writeBytes(reflectxData)
 	if len(methods.Contents) != 0 {
 		if err := es.w.put(&methods); err != nil {
-			Failf("writing method callbacks: %w", err)
+			Failf("writing method functions: %w", err)
 		}
 	}
 
