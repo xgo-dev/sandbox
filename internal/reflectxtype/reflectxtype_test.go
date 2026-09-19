@@ -367,7 +367,7 @@ func TestConcreteMethods(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			methods, functions, _ := concreteMethodSet(got)
+			methods, functions, _, _ := concreteMethodSet(got)
 			if len(methods) != 1 || methods[0].Name != "hidden" || methods[0].PkgPath != "example/methods" || methods[0].Pointer != pointer {
 				t.Fatalf("method metadata: %+v", methods)
 			}

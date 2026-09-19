@@ -146,7 +146,7 @@ func TestRetainedMethodIDs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	current, _, _ := concreteMethodSet(restored)
+	current, _, _, _ := concreteMethodSet(restored)
 	if current[1].Name != "execWith" || current[1].PkgPath != "example/b" {
 		t.Fatalf("fixture did not reorder methods: %v", current)
 	}

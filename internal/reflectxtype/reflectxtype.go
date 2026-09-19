@@ -23,6 +23,7 @@ import (
 // Snapshot holds encoded definitions and their host-local, nonzero IDs. Only
 // Data crosses the process boundary. IDs include referenced system types;
 // system references use the same static locations as the reflecttype codec.
+// Methods contains one function per distinct pair of runtime method entries.
 type Snapshot struct {
 	Data    []byte
 	IDs     map[reflect.Type]uint32
@@ -82,9 +83,10 @@ func export(previous *ReflectType) (*Snapshot, error) {
 		interfaces map[string]reflect.Type
 	})(unsafe.Pointer(reflectx.Default))
 	e := exporter{
-		ids:      make(map[reflect.Type]uint32),
-		needed:   make(map[reflect.Type]bool),
-		visiting: make(map[reflect.Type]bool),
+		ids:           make(map[reflect.Type]uint32),
+		needed:        make(map[reflect.Type]bool),
+		visiting:      make(map[reflect.Type]bool),
+		sharedMethods: make(map[methodEntries]int),
 	}
 	if previous != nil {
 		e.entries = make([][]byte, len(previous.types))
@@ -95,6 +97,18 @@ func export(previous *ReflectType) (*Snapshot, error) {
 			def := previous.definitions[i]
 			if def.kind != reflect.Interface && len(def.methods) != 0 {
 				e.retainedMethods[typ] = def.methods
+				methods, _, _, entries := concreteMethodSet(typ)
+				indices := make(map[methodIdentity]int, len(methods))
+				for j, method := range methods {
+					indices[methodIdentity{method.Name, method.PkgPath, method.Pointer}] = j
+				}
+				for _, method := range def.methods {
+					index, ok := indices[methodIdentity{method.name, method.pkg, method.pointer}]
+					if !ok {
+						return nil, fmt.Errorf("retained method %s.%s changed for %v", method.pkg, method.name, typ)
+					}
+					e.sharedMethods[entries[index]] = method.function
+				}
 			}
 		}
 		for i, typ := range previous.types {
@@ -149,6 +163,7 @@ type exporter struct {
 	visiting        map[reflect.Type]bool
 	methods         []reflect.Value
 	retainedMethods map[reflect.Type][]method
+	sharedMethods   map[methodEntries]int
 }
 
 func (e *exporter) requiresReflectx(typ reflect.Type) bool {
@@ -208,8 +223,9 @@ func (e *exporter) encode(typ reflect.Type) ([]byte, error) {
 	var methods []reflectx.Method
 	var functions []reflect.Value
 	var hasInterface []bool
+	var entries []methodEntries
 	if kind != reflect.Interface && (kind != reflect.Pointer || typ.Name() != "") {
-		methods, functions, hasInterface = concreteMethodSet(typ)
+		methods, functions, hasInterface, entries = concreteMethodSet(typ)
 	}
 	retained := e.retainedMethods[typ]
 	if len(retained) != 0 && len(retained) != len(methods) {
@@ -292,15 +308,11 @@ func (e *exporter) encode(typ reflect.Type) ([]byte, error) {
 		}
 	}
 	if len(methods) != 0 {
-		type identity struct {
-			name, pkg string
-			pointer   bool
-		}
-		var indices map[identity]int
+		var indices map[methodIdentity]int
 		if len(retained) != 0 {
-			indices = make(map[identity]int, len(methods))
+			indices = make(map[methodIdentity]int, len(methods))
 			for i, method := range methods {
-				indices[identity{method.Name, method.PkgPath, method.Pointer}] = i
+				indices[methodIdentity{method.Name, method.PkgPath, method.Pointer}] = i
 			}
 		}
 		data = binary.AppendUvarint(data, uint64(len(methods)))
@@ -311,7 +323,7 @@ func (e *exporter) encode(typ reflect.Type) ([]byte, error) {
 				// Match their identities while preserving the original wire order.
 				previous := retained[i]
 				var ok bool
-				index, ok = indices[identity{previous.name, previous.pkg, previous.pointer}]
+				index, ok = indices[methodIdentity{previous.name, previous.pkg, previous.pointer}]
 				if !ok {
 					return nil, fmt.Errorf("retained method %s.%s changed for %v", previous.pkg, previous.name, typ)
 				}
@@ -329,8 +341,12 @@ func (e *exporter) encode(typ reflect.Type) ([]byte, error) {
 				id = retained[i].function
 				e.methods[id-1] = functions[index]
 			} else {
-				e.methods = append(e.methods, functions[i])
-				id = len(e.methods)
+				id = e.sharedMethods[entries[index]]
+				if id == 0 {
+					e.methods = append(e.methods, functions[index])
+					id = len(e.methods)
+					e.sharedMethods[entries[index]] = id
+				}
 			}
 			data = binary.AppendUvarint(data, uint64(id))
 		}

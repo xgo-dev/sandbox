@@ -94,18 +94,30 @@ func open(data []byte, previous *Snapshot) (result *ReflectType, err error) {
 	}
 	// Callback IDs index the complete method table, not the bytes remaining
 	// in an individual type record. For example, its last byte may be ID 1.
-	functions := make([]bool, d.methodCount)
+	functions := make([]method, d.methodCount)
+	var methodCount int
 	for _, def := range d.definitions {
 		if def.kind == reflect.Interface {
 			continue
 		}
 		for _, method := range def.methods {
-			if method.function > d.methodCount || functions[method.function-1] {
+			if method.function > d.methodCount {
 				return nil, fmt.Errorf("invalid method function index %d", method.function)
 			}
-			functions[method.function-1] = true
+			previous := functions[method.function-1]
+			if previous.function != 0 && previous != method {
+				return nil, fmt.Errorf("invalid method function index %d: inconsistent shared method", method.function)
+			}
+			functions[method.function-1] = method
+			methodCount = max(methodCount, method.function)
 		}
 	}
+	for i := range methodCount {
+		if functions[i].function == 0 {
+			return nil, fmt.Errorf("missing method function index %d", i+1)
+		}
+	}
+	d.methodCount = methodCount
 	// Named types must keep their identity when a dependency refers back to them.
 	// The mock has the final storage layout; e.g. Node{N int; Next *Node} uses
 	// {N int; Next *struct{}} until its fields can point at the completed types.

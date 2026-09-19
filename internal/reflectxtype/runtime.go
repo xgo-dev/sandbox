@@ -27,6 +27,24 @@ func reflectTypeLinks() ([]unsafe.Pointer, [][]int32)
 //go:linkname reflectToType reflect.toType
 func reflectToType(unsafe.Pointer) reflect.Type
 
+// Go 1.26.6 reflectOffs with the default amd64/arm64 runtime mutex layout.
+// Access the maps only while holding the runtime's lock; our transferMu does
+// not serialize reflect constructors in other goroutines.
+//
+//go:linkname reflectOffsets runtime.reflectOffs
+var reflectOffsets struct {
+	lock uintptr
+	next int32
+	m    map[int32]unsafe.Pointer
+	minv map[unsafe.Pointer]int32
+}
+
+//go:linkname reflectOffsetsLock runtime.reflectOffsLock
+func reflectOffsetsLock()
+
+//go:linkname reflectOffsetsUnlock runtime.reflectOffsUnlock
+func reflectOffsetsUnlock()
+
 func indexStaticTypes() *staticTypeIndex {
 	sections, offsets := reflectTypeLinks()
 	index := &staticTypeIndex{
