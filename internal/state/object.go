@@ -418,18 +418,24 @@ type reflectedValue struct {
 	Type        typeSpec
 	Value       object
 	Addressable bool
+	ReadOnly    uint64
 }
 
 func (v *reflectedValue) save(w *writer) {
 	saveTypeSpec(w, v.Type)
 	boolValue(v.Addressable).save(w)
+	uintValue(v.ReadOnly).save(w)
 	saveObject(w, v.Value)
 }
 
 func (*reflectedValue) load(r *reader) object {
 	typ := loadTypeSpec(r)
 	addressable := loadBool(r)
-	return &reflectedValue{Type: typ, Value: loadObject(r), Addressable: bool(addressable)}
+	readOnly := uint64(loadUint(r))
+	if readOnly&^reflectValueReadOnlyMask != 0 {
+		Failf("invalid reflect.Value read-only flags %#x", readOnly)
+	}
+	return &reflectedValue{Type: typ, Value: loadObject(r), Addressable: bool(addressable), ReadOnly: readOnly}
 }
 
 // loadSlice loads an object of type sliceValue.

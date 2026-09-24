@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
-	"strings"
 	"testing"
 )
 
@@ -174,18 +173,140 @@ func TestReflectValueLoadWait(t *testing.T) {
 	}
 }
 
-func TestReflectValueRestricted(t *testing.T) {
-	src := reflect.ValueOf(struct{ hidden int }{42}).Field(0)
-	if _, _, err := Save(context.Background(), make([]byte, 4096), &src); err == nil || !strings.Contains(err.Error(), "restricted access") {
-		t.Fatalf("restricted value: %v", err)
+func TestReflectValuePrivateFields(t *testing.T) {
+	n := 42
+	owner := struct {
+		number   int
+		text     string
+		pointer  *int
+		slice    []int
+		array    [2]int
+		mapping  map[string]int
+		iface    any
+		nilIface any
+	}{42, "private", &n, []int{1, 2}, [2]int{3, 4}, map[string]int{"n": 5}, 6, nil}
+	for _, parent := range []reflect.Value{reflect.ValueOf(owner), reflect.ValueOf(&owner).Elem()} {
+		var src []reflect.Value
+		for i := 0; i < parent.NumField(); i++ {
+			src = append(src, parent.Field(i))
+		}
+		var dst []reflect.Value
+		roundtrip(t, &src, &dst)
+		runtime.GC()
+		for i, value := range src {
+			got := dst[i]
+			if value.CanInterface() || got.CanInterface() || value.CanSet() || got.CanSet() || got.CanAddr() != value.CanAddr() || got.Type() != value.Type() {
+				t.Fatalf("field %d: private access or type changed", i)
+			}
+			for _, call := range []func(){func() { got.Interface() }, func() { got.Set(reflect.Zero(got.Type())) }} {
+				func() {
+					defer func() {
+						if recover() == nil {
+							t.Errorf("field %d: restricted operation succeeded", i)
+						}
+					}()
+					call()
+				}()
+			}
+		}
+		if dst[0].Int() != 42 || dst[1].String() != "private" || dst[2].Elem().Int() != 42 || dst[3].Index(1).Int() != 2 || dst[4].Index(1).Int() != 4 || dst[5].MapIndex(reflect.ValueOf("n")).Int() != 5 || dst[6].Elem().Int() != 6 || !dst[7].IsNil() {
+			t.Fatal("private field data changed")
+		}
+		if dst[2].Pointer() == reflect.ValueOf(&n).Pointer() {
+			t.Fatal("private pointer reused the source allocation")
+		}
+	}
+}
+
+type reflectedPrivateEmbedded struct {
+	Exported int
+	hidden   int
+}
+
+func TestReflectValuePrivateEmbedded(t *testing.T) {
+	owner := struct {
+		reflectedPrivateEmbedded
+		named  reflectedPrivateEmbedded
+		nested struct{ reflectedPrivateEmbedded }
+	}{
+		reflectedPrivateEmbedded: reflectedPrivateEmbedded{1, 2},
+		named:                    reflectedPrivateEmbedded{3, 4},
+		nested:                   struct{ reflectedPrivateEmbedded }{reflectedPrivateEmbedded{5, 6}},
+	}
+	for _, parent := range []reflect.Value{reflect.ValueOf(owner), reflect.ValueOf(&owner).Elem()} {
+		// EmbedRO alone permits access to Exported; StickyRO, including the
+		// combination from nested's private embedded field, must propagate.
+		src := []reflect.Value{parent.Field(0), parent.Field(1), parent.Field(2).Field(0)}
+		var dst []reflect.Value
+		roundtrip(t, &src, &dst)
+		for i, value := range src {
+			got := dst[i]
+			if value.CanInterface() || got.CanInterface() || got.CanSet() || got.CanAddr() != value.CanAddr() {
+				t.Fatalf("embedded value %d changed access", i)
+			}
+			for j := 0; j < value.NumField(); j++ {
+				before, after := value.Field(j), got.Field(j)
+				if before.CanInterface() != after.CanInterface() || before.CanSet() != after.CanSet() || before.Int() != after.Int() {
+					t.Fatalf("embedded value %d field %d lost access propagation", i, j)
+				}
+				if after.CanSet() {
+					after.SetInt(99)
+					if before.Int() == 99 {
+						t.Fatal("restored embedded field still aliases the source")
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestReflectValuePrivateRoundTrip(t *testing.T) {
+	type owner struct{ hidden int }
+	type root struct {
+		Owner    *owner
+		Private  reflect.Value
+		Writable reflect.Value
+	}
+	original := &owner{42}
+	host := root{original, reflect.ValueOf(original).Elem().Field(0), reflect.ValueOf(&original.hidden).Elem()}
+	var guest root
+	var hostState, guestState State
+	ctx := context.Background()
+	mem := make([]byte, 1<<20)
+	n, _, err := hostState.Save(ctx, mem, &host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := guestState.Load(ctx, mem[:n], &guest); err != nil {
+		t.Fatal(err)
+	}
+	if guest.Owner == original || guest.Private.UnsafeAddr() != guest.Writable.UnsafeAddr() {
+		t.Fatal("private field aliases were not relocated")
+	}
+	guest.Writable.SetInt(43)
+	if guest.Owner.hidden != 43 || guest.Private.Int() != 43 || original.hidden != 42 || guest.Private.CanInterface() || guest.Private.CanSet() {
+		t.Fatal("private view lost its value, restrictions or source isolation")
+	}
+	n, _, err = guestState.Save(ctx, mem, &guest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hostState.Load(ctx, mem[:n], &host); err != nil {
+		t.Fatal(err)
+	}
+	runtime.GC()
+	if host.Owner != original || original.hidden != 43 || host.Private.Int() != 43 || host.Private.UnsafeAddr() != reflect.ValueOf(&original.hidden).Pointer() || host.Private.CanInterface() || host.Private.CanSet() || !host.Writable.CanSet() {
+		t.Fatal("private field writeback lost identity or access restrictions")
 	}
 }
 
 func TestReflectValueNewProcess(t *testing.T) {
 	type root struct {
-		Value reflect.Value
-		Field *int
-		Type  reflect.Type
+		Value   reflect.Value
+		Field   *int
+		Type    reflect.Type
+		Private reflect.Value
+		Hidden  *int
 	}
 	const imageEnv = "SANDBOX_STATE_VALUE_TEST_IMAGE"
 	if path := os.Getenv(imageEnv); path != "" {
@@ -201,7 +322,11 @@ func TestReflectValueNewProcess(t *testing.T) {
 		if dst.Value.Type() != dst.Type || dst.Value.Field(0).Addr().Interface().(*int) != dst.Field || *dst.Field != 42 {
 			t.Fatal("reflected type, value or alias changed in the child")
 		}
+		if dst.Private.Int() != 47 || dst.Private.CanInterface() || dst.Private.CanSet() || dst.Private.UnsafeAddr() != reflect.ValueOf(dst.Hidden).Pointer() {
+			t.Fatal("private field access or alias changed in the child")
+		}
 		dst.Value.Field(0).SetInt(43)
+		*dst.Hidden = 48
 		output := make([]byte, 1<<20)
 		n, _, err := Save(context.Background(), output, &dst)
 		if err != nil {
@@ -215,7 +340,11 @@ func TestReflectValueNewProcess(t *testing.T) {
 	typ := reflect.StructOf([]reflect.StructField{{Name: "Count", Type: reflect.TypeFor[int](), Tag: `state:"value"`}})
 	value := reflect.New(typ).Elem()
 	value.Field(0).SetInt(42)
-	src := root{Value: value, Field: value.Field(0).Addr().Interface().(*int), Type: typ}
+	hidden := struct{ hidden int }{47}
+	src := root{
+		Value: value, Field: value.Field(0).Addr().Interface().(*int), Type: typ,
+		Private: reflect.ValueOf(&hidden).Elem().Field(0), Hidden: &hidden.hidden,
+	}
 	mem := make([]byte, 1<<20)
 	n, _, err := Save(context.Background(), mem, &src)
 	if err != nil {
@@ -240,5 +369,8 @@ func TestReflectValueNewProcess(t *testing.T) {
 	}
 	if dst.Value.Field(0).Int() != 43 || dst.Value.Field(0).Addr().Interface().(*int) != dst.Field || *src.Field != 42 {
 		t.Fatal("return transfer lost value, aliases or source isolation")
+	}
+	if dst.Private.Int() != 48 || dst.Private.CanInterface() || dst.Private.CanSet() || dst.Private.UnsafeAddr() != reflect.ValueOf(dst.Hidden).Pointer() || hidden.hidden != 47 {
+		t.Fatal("return transfer lost private field data, aliases or access restrictions")
 	}
 }

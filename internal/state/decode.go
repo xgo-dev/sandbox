@@ -744,7 +744,7 @@ func (ds *decodeState) decodeObject(ods *objectDecodeState, obj reflect.Value, e
 			Failf("reflect.Value cannot be assigned to %v", obj.Type())
 		}
 		if _, invalid := x.Type.(nilType); invalid {
-			if _, empty := x.Value.(nilValue); !empty || x.Addressable {
+			if _, empty := x.Value.(nilValue); !empty || x.Addressable || x.ReadOnly != 0 {
 				Failf("invalid zero reflect.Value")
 			}
 			obj.SetZero()
@@ -764,6 +764,10 @@ func (ds *decodeState) decodeObject(ods *objectDecodeState, obj reflect.Value, e
 			storage := reflect.New(typ).Elem()
 			ds.decodeObject(ods, storage, x.Value)
 			value = reflectValueUnaddressable(storage)
+		}
+		if x.ReadOnly != 0 {
+			flag := reflect.ValueOf(&value).Elem().FieldByName("flag")
+			reflectValueRWAddr(flag).Elem().SetUint(flag.Uint() | x.ReadOnly)
 		}
 		obj.Set(reflect.ValueOf(value))
 	default:

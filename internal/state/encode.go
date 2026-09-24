@@ -769,7 +769,11 @@ func (es *encodeState) encodeObject(obj reflect.Value, how encodeStrategy, dest 
 			return
 		}
 		if !value.CanInterface() {
-			Failf("reflect.Value has restricted access")
+			// Clear access restrictions on this Value copy only. The restored
+			// view must retain them even though state can traverse private data.
+			flag := reflect.ValueOf(&value).Elem().FieldByName("flag")
+			encoded.ReadOnly = flag.Uint() & reflectValueReadOnlyMask
+			reflectValueRWAddr(flag).Elem().SetUint(flag.Uint() &^ reflectValueReadOnlyMask)
 		}
 		encoded.Addressable = value.CanAddr()
 		if encoded.Addressable {

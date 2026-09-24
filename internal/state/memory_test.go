@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -50,6 +51,9 @@ func objectExamples() []object {
 		&reflectTypeValue{Type: &reflectedType{ID: 1, reflectx: true}},
 		&reflectedValue{Type: typeSpecID(1), Value: intValue(42)},
 		&reflectedValue{Type: &pointerType{Type: typeSpecID(1)}, Value: &refValue{Root: 2}, Addressable: true},
+		&reflectedValue{Type: typeSpecID(1), Value: intValue(42), ReadOnly: 1 << 5},
+		&reflectedValue{Type: typeSpecID(1), Value: intValue(42), ReadOnly: 1 << 6},
+		&reflectedValue{Type: &pointerType{Type: typeSpecID(1)}, Value: &refValue{Root: 2}, Addressable: true, ReadOnly: reflectValueReadOnlyMask},
 		&refValue{Root: 3, Dots: []dot{&f}, Type: closureType(0x520000)},
 	}
 }
@@ -88,6 +92,19 @@ func TestMemoryObjects(t *testing.T) {
 				t.Fatal("object bytes changed after decoding")
 			}
 		})
+	}
+}
+
+func TestMemoryReflectValueReadOnlyFlags(t *testing.T) {
+	for _, flags := range []uint64{1 << 7, 1 << 8, 1 << 63, ^uint64(0)} {
+		w := writer{mem: make([]byte, 128)}
+		if err := w.put(&reflectedValue{Type: typeSpecID(1), Value: intValue(42), ReadOnly: flags}); err != nil {
+			t.Fatal(err)
+		}
+		r := reader{mem: w.mem[:w.pos]}
+		if _, err := r.get(); err == nil || !strings.Contains(err.Error(), "invalid reflect.Value read-only flags") {
+			t.Fatalf("accepted flags %#x: %v", flags, err)
+		}
 	}
 }
 

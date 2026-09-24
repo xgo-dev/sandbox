@@ -21,6 +21,10 @@ import (
 	"unsafe"
 )
 
+// Go 1.26 reflect/value.go: flagStickyRO and flagEmbedRO have distinct Field
+// propagation rules. Keep both bits instead of collapsing them to CanInterface.
+const reflectValueReadOnlyMask = uint64(1<<5 | 1<<6)
+
 // reflectValueRWAddr is equivalent to obj.Addr(), except that the returned
 // reflect.Value is usable in assignments even if obj was obtained by the use
 // of unexported struct fields.
