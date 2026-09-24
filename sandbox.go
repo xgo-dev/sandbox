@@ -2,7 +2,10 @@
 // captured object graph back to the caller. See README.md for transfer limits.
 package sandbox
 
-import "sync"
+import (
+	"errors"
+	"sync"
+)
 
 // Syscall is a trapped guest syscall, observed after Context.Switch returns and
 // before Sentry dispatches it. Addresses in Args belong to the guest.
@@ -44,9 +47,14 @@ type Sandbox struct {
 	closed    bool
 	closeDone chan struct{}
 	closeErr  error
+	processes map[uint64]*Process
 }
 
 var defaultSandbox Sandbox
 
-// Run executes fn using a process-lifetime default Sandbox.
-func Run(fn func()) error { return defaultSandbox.Run(fn) }
+// Run executes fn in a one-shot Process using the shared default Sandbox.
+func Run(fn func()) (err error) {
+	p := NewProcess()
+	defer func() { err = errors.Join(err, p.Close()) }()
+	return p.Run(fn)
+}

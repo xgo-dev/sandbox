@@ -26,8 +26,8 @@ import (
 	"runtime"
 	"sync"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/cpuid"
-	"gvisor.dev/gvisor/pkg/memutil"
 	"gvisor.dev/gvisor/pkg/rand"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/cgroup2fs"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/host"
@@ -50,7 +50,7 @@ var sharedPlatform platform.Platform
 var platformErr error
 
 // Systrap owns process-lifetime memory and stub pools. Each Sandbox owns a
-// Kernel; its fresh guest processes share that Kernel and platform.
+// Kernel; its resident guest processes share that Kernel and platform.
 func newKernel(p *observedPlatform) (*kernel.Kernel, error) {
 	cpuid.Initialize()
 	seccheck.Initialize()
@@ -77,12 +77,22 @@ func newKernel(p *observedPlatform) (*kernel.Kernel, error) {
 	p.Platform = sharedPlatform
 	k := &kernel.Kernel{Platform: p}
 
-	memoryFD, err := memutil.CreateMemFD("llar-runtime-memory", 0)
+	// A disk file lets idle processes release resident pages without losing
+	// their virtual addresses. Unlink it immediately; Kernel owns its lifetime.
+	memoryFile, err := os.CreateTemp("", "llar-runtime-memory-*")
 	if err != nil {
 		return nil, err
 	}
-	memoryFile := os.NewFile(uintptr(memoryFD), "llar-runtime-memory")
-	mf, err := pgalloc.NewMemoryFile(memoryFile, pgalloc.MemoryFileOpts{})
+	if err := os.Remove(memoryFile.Name()); err != nil {
+		memoryFile.Close()
+		return nil, err
+	}
+	var stat unix.Statfs_t
+	if err := unix.Fstatfs(int(memoryFile.Fd()), &stat); err != nil {
+		memoryFile.Close()
+		return nil, err
+	}
+	mf, err := pgalloc.NewMemoryFile(memoryFile, pgalloc.MemoryFileOpts{DiskBackedFile: stat.Type != unix.TMPFS_MAGIC && stat.Type != unix.RAMFS_MAGIC, DecommitOnDestroy: true})
 	if err != nil {
 		memoryFile.Close()
 		return nil, err

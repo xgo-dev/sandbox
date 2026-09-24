@@ -79,17 +79,44 @@ func CloseSandbox(handle C.uintptr_t, message *C.char, capacity C.size_t) C.int 
 	}
 	s.mu.Lock()
 	s.closed = true
-	s.kernel.Kill(linux.WaitStatusExit(1))
+	processes := make([]*guestProcess, 0, len(s.processes))
+	for _, p := range s.processes {
+		processes = append(processes, p)
+	}
 	s.mu.Unlock()
+	var closeErr error
+	for _, p := range processes {
+		closeErr = errors.Join(closeErr, p.close())
+	}
 	s.runs.Wait()
+	s.kernel.Kill(linux.WaitStatusExit(1))
 	s.kernel.WaitExited()
 	s.dog.Stop()
 	s.kernel.Release()
-	return 0
+	return reportError(closeErr, message, capacity)
 }
 
 //export RunSandbox
 func RunSandbox(handle C.uintptr_t, config *C.char, imageFD C.int, mainPC, entryPC, owner C.uintptr_t, callback C.inspect_fn, message *C.char, capacity C.size_t) (code C.int) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	report := func(err error) { code = reportError(err, message, capacity) }
+	defer func() {
+		if v := recover(); v != nil {
+			report(fmt.Errorf("Sentry process operation panicked: %v", v))
+		}
+	}()
+	var startup struct {
+		Operation string   `json:"operation"`
+		Process   uint64   `json:"process"`
+		Guest     string   `json:"guest"`
+		Mounts    []mount  `json:"mounts"`
+		Env       []string `json:"env"`
+	}
+	if err := json.Unmarshal([]byte(C.GoString(config)), &startup); err != nil {
+		report(fmt.Errorf("Sentry configuration: %w", err))
+		return
+	}
 	kernels.Lock()
 	s := kernels.live[uintptr(handle)]
 	if s != nil {
@@ -97,31 +124,39 @@ func RunSandbox(handle C.uintptr_t, config *C.char, imageFD C.int, mainPC, entry
 	}
 	kernels.Unlock()
 	if s == nil {
-		return reportError(errors.New("sandbox is closed"), message, capacity)
+		if startup.Operation != "close" {
+			report(errors.New("sandbox is closed"))
+		}
+		return
 	}
 	defer s.runs.Done()
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-	report := func(err error) {
-		code = reportError(err, message, capacity)
-	}
-	defer func() {
-		if v := recover(); v != nil {
-			report(fmt.Errorf("Sentry startup panicked: %v", v))
+	if startup.Operation == "close" || startup.Operation == "run" {
+		s.mu.Lock()
+		process := s.processes[startup.Process]
+		if startup.Operation == "close" {
+			delete(s.processes, startup.Process)
 		}
-	}()
-	var startup struct {
-		Guest  string   `json:"guest"`
-		Mounts []mount  `json:"mounts"`
-		Env    []string `json:"env"`
+		closed := s.closed
+		s.mu.Unlock()
+		if startup.Operation == "close" {
+			if process != nil {
+				report(process.close())
+			}
+			return
+		}
+		if closed || process == nil {
+			report(errors.New("process is closed or missing"))
+			return
+		}
+		report(process.run(int(imageFD)))
+		return
 	}
-	if err := json.Unmarshal([]byte(C.GoString(config)), &startup); err != nil {
-		report(fmt.Errorf("Sentry startup configuration: %w", err))
-		return code
+	if startup.Operation != "create" {
+		report(errors.New("invalid process operation"))
+		return
 	}
-	var inspectionMu sync.Mutex
-	var inspectionErr error
-	err := s.run(startup.Mounts, startup.Guest, startup.Env, int(imageFD), uintptr(mainPC), uintptr(entryPC), func(ctx gcontext.Context, ac *arch.Context64) error {
+	process := &guestProcess{}
+	process.inspect = func(ctx gcontext.Context, ac *arch.Context64) error {
 		if callback == nil {
 			return nil
 		}
@@ -154,11 +189,11 @@ func RunSandbox(handle C.uintptr_t, config *C.char, imageFD C.int, mainPC, entry
 			}
 		}
 		if err != nil {
-			inspectionMu.Lock()
-			if inspectionErr == nil {
-				inspectionErr = err
+			process.inspectionMu.Lock()
+			if process.inspectionErr == nil {
+				process.inspectionErr = err
 			}
-			inspectionMu.Unlock()
+			process.inspectionMu.Unlock()
 			_ = task.Kernel().SendContainerSignal(task.ContainerID(), &linux.SignalInfo{Signo: int32(linux.SIGKILL)})
 			return err
 		}
@@ -169,14 +204,9 @@ func RunSandbox(handle C.uintptr_t, config *C.char, imageFD C.int, mainPC, entry
 		setSyscall(ac, uint64(event.number), args)
 		ac.SyscallSaveOrig()
 		return nil
-	})
-	if inspectionErr != nil {
-		err = inspectionErr
 	}
-	if err != nil {
-		report(err)
-	}
-	return code
+	report(s.start(startup.Process, process, startup.Mounts, startup.Guest, startup.Env, int(imageFD), uintptr(mainPC), uintptr(entryPC)))
+	return
 }
 
 func main() {}

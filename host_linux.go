@@ -80,82 +80,108 @@ func sandboxInspect(owner C.uintptr_t, event *C.struct_syscall_event) {
 	}
 }
 
-// Run executes fn in a fresh guest running the same ELF. The guest enters the
-// closure automatically after package initialization, without running main.
-// Capture mutations are committed only after a successful guest exit.
-// Captures must be exclusively owned for the duration of Run. Calls may overlap
-// when their captured graphs are independent. Configuration must not change
-// until all active calls return.
+type processState struct {
+	kernel     uintptr
+	inspection cgo.Handle
+	observer   *inspection
+	graph      state.State
+	fn         func()
+}
+
+// Run executes fn in a new guest and closes it after writing captures back.
 func (s *Sandbox) Run(fn func()) (err error) {
+	p := NewProcess(ProcessOptions{Mounts: s.Mounts, Env: s.Env, Inspect: s.Inspect})
+	p.owner = s
+	defer func() { err = errors.Join(err, p.Close()) }()
+	return p.Run(fn)
+}
+
+// Run executes fn in this process and pauses the guest before returning.
+// Calls on one Process are serialized. Captures must be exclusively owned
+// until Run returns. A failed transfer or guest execution closes the process.
+func (p *Process) Run(fn func()) (err error) {
 	if fn == nil {
-		return fmt.Errorf("sandbox: nil function")
+		return errors.New("sandbox: nil function")
 	}
-	handleID, err := s.acquire()
+	p.runMu.Lock()
+	p.mu.Lock()
+	if p.closed || p.failure != nil || p.owner == nil {
+		err = p.failure
+		if err == nil {
+			err = errors.New("sandbox: process is closed or uninitialized")
+		}
+		p.mu.Unlock()
+		p.runMu.Unlock()
+		return err
+	}
+	p.runs.Add(1)
+	p.mu.Unlock()
+	transfer := false
+	defer func() {
+		if err != nil && transfer {
+			p.mu.Lock()
+			p.failure = err
+			p.mu.Unlock()
+		}
+		p.runs.Done()
+		p.runMu.Unlock()
+		if err != nil && transfer {
+			err = errors.Join(err, p.Close())
+		}
+	}()
+	kernelID, err := p.owner.acquire()
 	if err != nil {
 		return err
 	}
-	defer s.active.Done()
-	mainPC, err := guestMain()
-	if err != nil {
-		return err
-	}
-	entryPC := reflect.ValueOf(guestEntry).Pointer()
+	defer p.owner.active.Done()
 	fd, err := newStateImage()
 	if err != nil {
 		return err
 	}
 	defer unix.Close(fd)
-	var graph state.State
-	ctx := context.Background()
-	resultOffset, err := writeStateImage(fd, 0, &graph, &fn)
+	p.native.fn = fn
+	resultOffset, err := writeStateImage(fd, 0, &p.native.graph, &p.native.fn)
 	if err != nil {
 		return fmt.Errorf("sandbox export: %w", err)
 	}
+	transfer = true
 	runtime.GC()
-	executable, err := os.Executable()
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return errors.New("sandbox: process is closed")
+	}
+	if p.native.kernel == 0 {
+		p.native.kernel = kernelID
+		p.native.observer = &inspection{fn: p.options.Inspect}
+		if p.options.Inspect != nil {
+			p.native.inspection = cgo.NewHandle(p.native.observer)
+		}
+		err = p.call("create", fd)
+		if err == nil {
+			p.owner.mu.Lock()
+			if p.owner.processes == nil {
+				p.owner.processes = make(map[uint64]*Process)
+			}
+			p.owner.processes[p.id] = p
+			p.owner.mu.Unlock()
+		}
+	}
+	p.mu.Unlock()
 	if err != nil {
 		return err
 	}
-	mounts := s.Mounts
-	if len(mounts) == 0 {
-		mounts = []Mount{
-			{Type: "bind", Source: "/", Target: "/", Options: []string{"ro"}},
-			{Type: "proc", Target: "/proc"},
-		}
+	if err := p.call("run", fd); err != nil {
+		return err
 	}
-	env := s.Env
-	if env == nil {
-		env = os.Environ()
-	}
-	config, err := json.Marshal(struct {
-		Guest  string   `json:"guest"`
-		Mounts []Mount  `json:"mounts"`
-		Env    []string `json:"env"`
-	}{executable, mounts, env})
-	if err != nil {
-		return fmt.Errorf("sandbox configuration: %w", err)
-	}
-	cConfig := C.CString(string(config))
-	defer C.free(unsafe.Pointer(cConfig))
-	i := &inspection{fn: s.Inspect}
-	var handle cgo.Handle
-	if s.Inspect != nil {
-		handle = cgo.NewHandle(i)
-		defer handle.Delete()
-	}
-	var message [4096]C.char
-	code := C.sandbox_run(C.uintptr_t(handleID), cConfig, C.int(fd), C.uintptr_t(mainPC), C.uintptr_t(entryPC), C.uintptr_t(handle), &message[0], C.size_t(len(message)))
-	if code != 0 {
-		return fmt.Errorf("sandbox Sentry: %s", C.GoString(&message[0]))
-	}
-	i.mu.Lock()
-	inspectionErr := i.err
-	i.mu.Unlock()
+	p.native.observer.mu.Lock()
+	inspectionErr := p.native.observer.err
+	p.native.observer.mu.Unlock()
 	if inspectionErr != nil {
 		return inspectionErr
 	}
-	// Seal before either decode pass, including against any fd the guest
-	// transferred elsewhere. Existing writable mappings make this fail.
+	// Each call gets a new memfd. The previous result stays sealed even if the
+	// resident guest retained a duplicate descriptor across calls.
 	if _, err := unix.FcntlInt(uintptr(fd), unix.F_ADD_SEALS, unix.F_SEAL_WRITE|unix.F_SEAL_SEAL); err != nil {
 		return fmt.Errorf("sandbox result seal: %w", err)
 	}
@@ -164,12 +190,80 @@ func (s *Sandbox) Run(fn func()) (err error) {
 		return fmt.Errorf("sandbox result: %w", err)
 	}
 	defer func() { err = errors.Join(err, unmap()) }()
-	if _, err := graph.Load(ctx, data, &fn); err != nil {
+	if _, err := p.native.graph.Load(context.Background(), data, &p.native.fn); err != nil {
 		return fmt.Errorf("sandbox import: %w", err)
 	}
-	graph = state.State{}
 	runtime.GC()
 	return nil
+}
+
+func (p *Process) call(operation string, fd int) error {
+	config := struct {
+		Operation string   `json:"operation"`
+		Process   uint64   `json:"process"`
+		Guest     string   `json:"guest,omitempty"`
+		Mounts    []Mount  `json:"mounts,omitempty"`
+		Env       []string `json:"env,omitempty"`
+	}{Operation: operation, Process: p.id}
+	var mainPC, entryPC uintptr
+	if operation == "create" {
+		var err error
+		mainPC, err = guestMain()
+		if err != nil {
+			return err
+		}
+		entryPC = reflect.ValueOf(guestEntry).Pointer()
+		config.Guest, err = os.Executable()
+		if err != nil {
+			return err
+		}
+		config.Mounts = p.options.Mounts
+		if len(config.Mounts) == 0 {
+			config.Mounts = []Mount{{Type: "bind", Source: "/", Target: "/", Options: []string{"ro"}}, {Type: "proc", Target: "/proc"}}
+		}
+		config.Env = p.options.Env
+		if config.Env == nil {
+			config.Env = os.Environ()
+		}
+	}
+	data, err := json.Marshal(config)
+	if err != nil {
+		return fmt.Errorf("sandbox configuration: %w", err)
+	}
+	cConfig := C.CString(string(data))
+	defer C.free(unsafe.Pointer(cConfig))
+	var message [4096]C.char
+	if C.sandbox_run(C.uintptr_t(p.native.kernel), cConfig, C.int(fd), C.uintptr_t(mainPC), C.uintptr_t(entryPC), C.uintptr_t(p.native.inspection), &message[0], C.size_t(len(message))) != 0 {
+		return fmt.Errorf("sandbox Sentry: %s", C.GoString(&message[0]))
+	}
+	return nil
+}
+
+// Close terminates this process, including an active Run, and releases its
+// resources. It is idempotent. Do not call it from this process's inspector.
+func (p *Process) Close() error {
+	p.closeOnce.Do(func() {
+		p.mu.Lock()
+		p.closed = true
+		started := p.native.kernel != 0
+		p.mu.Unlock()
+		if started {
+			p.closeErr = p.call("close", -1)
+		}
+		p.runs.Wait()
+		if p.native.inspection != 0 {
+			p.native.inspection.Delete()
+			p.native.inspection = 0
+		}
+		p.native.graph = state.State{}
+		p.native.fn = nil
+		if p.owner != nil {
+			p.owner.mu.Lock()
+			delete(p.owner.processes, p.id)
+			p.owner.mu.Unlock()
+		}
+	})
+	return p.closeErr
 }
 
 func (s *Sandbox) acquire() (uintptr, error) {
@@ -237,6 +331,15 @@ func (s *Sandbox) Close() error {
 		}
 	}
 	s.active.Wait()
+	s.mu.Lock()
+	processes := make([]*Process, 0, len(s.processes))
+	for _, p := range s.processes {
+		processes = append(processes, p)
+	}
+	s.mu.Unlock()
+	for _, p := range processes {
+		err = errors.Join(err, p.Close())
+	}
 	s.closeErr = err
 	close(s.closeDone)
 	return err

@@ -27,17 +27,39 @@ func (p *observedPlatform) NewContext(ctx context.Context) platform.Context {
 	process := p.processes[task.ContainerID()]
 	process.tasks.Add(1)
 	p.mu.Unlock()
-	return &observedContext{Context: p.Platform.NewContext(ctx), process: process}
+	c := &observedContext{Context: p.Platform.NewContext(ctx), process: process, task: task}
+	// NewTask holds its signal lock here and has not assigned task.p yet.
+	// Only register the context; pause requests its stop outside taskMu.
+	process.taskMu.Lock()
+	process.contexts[c] = false
+	process.taskMu.Unlock()
+	return c
 }
 
 type observedContext struct {
 	platform.Context
 	process *guestProcess
+	task    *kernel.Task
+	mu      sync.Mutex // Serializes stop requests with platform context release.
 }
 
 func (c *observedContext) Release() {
+	c.mu.Lock()
+	p := c.process
+	p.taskMu.Lock()
+	stopped := p.contexts[c]
+	p.taskMu.Unlock()
+	// A task can finish its exit path without visiting doStop again. Balance
+	// any request that raced with exit before releasing the platform context.
+	if stopped {
+		c.task.EndExternalStop()
+	}
 	c.Context.Release()
-	c.process.tasks.Done()
+	p.taskMu.Lock()
+	delete(p.contexts, c)
+	p.taskMu.Unlock()
+	c.mu.Unlock()
+	p.tasks.Done()
 }
 
 func (c *observedContext) Switch(ctx context.Context, mm platform.MemoryManager, ac *arch.Context64, cpu int32) (*linux.SignalInfo, hostarch.AccessType, error) {

@@ -245,11 +245,11 @@ func mountFilesystem(ctx context.Context, k *kernel.Kernel, mounts []mount) (_ *
 	return mntns, nil
 }
 
-func importDescriptors(k *kernel.Kernel, imageFD int) (*kernel.FDTable, error) {
+func importDescriptors(k *kernel.Kernel, imageFD, controlFD int) (*kernel.FDTable, error) {
 	ctx := k.SupervisorContext()
 	table := k.NewFDTable()
 	files := make(map[int]*fd.FD)
-	for n, descriptor := range []int{int(os.Stdin.Fd()), int(os.Stdout.Fd()), int(os.Stderr.Fd()), imageFD} {
+	for n, descriptor := range []int{int(os.Stdin.Fd()), int(os.Stdout.Fd()), int(os.Stderr.Fd()), imageFD, controlFD} {
 		dup, err := unix.Dup(descriptor)
 		if err != nil {
 			table.DecRef(ctx)
@@ -262,6 +262,12 @@ func importDescriptors(k *kernel.Kernel, imageFD int) (*kernel.FDTable, error) {
 	if err != nil {
 		table.DecRef(ctx)
 		return nil, err
+	}
+	for _, descriptor := range []int32{3, 4} {
+		if err := table.SetFlags(ctx, descriptor, kernel.FDFlags{CloseOnExec: true}); err != nil {
+			table.DecRef(ctx)
+			return nil, err
+		}
 	}
 	return table, nil
 }

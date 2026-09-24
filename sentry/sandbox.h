@@ -20,7 +20,8 @@ struct syscall_event {
 typedef void (*inspect_fn)(uintptr_t, struct syscall_event *);
 typedef int (*create_sentry_fn)(uintptr_t *, char *, size_t);
 typedef int (*close_sentry_fn)(uintptr_t, char *, size_t);
-// Each run receives a Kernel handle and startup JSON (guest, mounts and env).
+// Dispatches create/run/close for a process ID within a Kernel.
+// Creation supplies guest/mount/env configuration; each run supplies a fresh image fd.
 typedef int (*run_sentry_fn)(uintptr_t, char *, int, uintptr_t, uintptr_t, uintptr_t,
                              inspect_fn, char *, size_t);
 

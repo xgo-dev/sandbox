@@ -37,21 +37,23 @@ int CloseSandbox(uintptr_t kernel, char *message, size_t capacity);
 - `CreateSandbox` starts one Kernel and returns its opaque handle. `RunSandbox` creates a fresh process under that Kernel, with independent PID and mount namespaces, FD table and inspection state. Calls may overlap. The internal task identity is inherited by guest children so inspection and cleanup remain scoped to the originating Run.
 - `CloseSandbox` rejects further calls, terminates tasks, waits for active runs and releases the Kernel. The caller must wait for its inspector callbacks to return; closing a Kernel synchronously from one of its own callbacks would deadlock.
 - `config` is a NUL-terminated JSON object containing `guest` (the executable's absolute guest path), `mounts` and `env` (an array of `KEY=value` strings). Sentry starts the executable with that path as `argv[0]` and no extra arguments. Mount entries contain `type`, optional `source`, `target` and optional `options` (an array of strings). Environment entries are passed directly to the new process before runtime initialization; NUL is rejected. Missing, null or empty `env` gives an empty environment at this C entry. The Go host implements `Sandbox.Env == nil` inheritance by explicitly sending its own `os.Environ()`.
-- `image_fd` is a caller-owned descriptor imported as guest fd 3. The library does not interpret its contents. Guest fd 0, 1 and 2 are imported from host stdin, stdout and stderr.
+- `image_fd` is a caller-owned descriptor imported as guest fd 3. The library does not interpret its contents. Guest fd 0, 1 and 2 are imported from host stdin, stdout and stderr. Creation also installs an internal control socket at fd 4. The guest reads a byte with value 1 before loading fd 3 and sends the same byte after publishing its result. Fds 3 and 4 are close-on-exec.
 - `main_pc` is the guest virtual address to redirect; the caller supplies its `main.main` address. The caller must verify that the symbol contains at least 5 bytes on AMD64 or 4 bytes on ARM64. Before starting guest tasks, the library writes a relative branch into this private executable mapping using Sentry's existing memory manager.
-- `entry_pc` is the guest virtual address of the caller's private, non-capturing Go `func()` startup entry. It runs after Go package initialization and returns after exporting closure results. The caller owns ELF symbol resolution, guest code and value reconstruction. The library checks branch range and alignment; it does not interpret the closure image. Unsupported branch layouts fail before creating the guest.
+- `entry_pc` is the guest virtual address of the caller's private, non-capturing Go `func()` startup entry. It runs after Go package initialization and waits for successive task commands until the process closes. The caller owns ELF symbol resolution, guest code and value reconstruction. The library checks branch range and alignment; it does not interpret the closure image. Unsupported branch layouts fail before creating the guest.
 - `owner` is an opaque integer passed unchanged to `inspect`. A Go caller can use a `cgo.Handle` owned by its own runtime.
 - `inspect` is an optional synchronous callback. It receives a borrowed `syscall_event` containing the syscall number, name, six arguments and a memory mapping callback. The caller owns argument parsing and may change the registers directly. A null callback skips inspection setup. Guest pointer arguments must not be dereferenced in the host.
-- `message` is a caller-owned writable error buffer of `capacity` bytes. For nonzero capacity, errors are truncated to at most `capacity - 1` bytes and NUL-terminated. No bytes are written at zero capacity. A nonzero result indicates an error; zero means that the guest exited successfully.
+- `message` is a caller-owned writable error buffer of `capacity` bytes. For nonzero capacity, errors are truncated to at most `capacity - 1` bytes and NUL-terminated. No bytes are written at zero capacity. A nonzero result indicates an error; zero means that the process operation completed successfully.
 
-All supplied strings, buffers and callback state must remain valid until `RunSandbox` returns. Each event, its name and its context handle are borrowed only for the duration of `inspect`. Load one library per host process and keep it loaded: its Go runtime and Systrap workers retain executable code for the process lifetime, even after all Kernels are closed.
+Configuration strings and error buffers must remain valid until the operation returns. The inspector callback and its owner state must remain valid until the created process is closed, including between Run calls. Each event, its name and its context handle are borrowed only for the duration of `inspect`. Load one library per host process and keep it loaded: its Go runtime and Systrap workers retain executable code for the process lifetime, even after all Kernels are closed.
 
 The lifecycle entry points and leading Kernel handle change the C ABI. Backends through `sentry/v0.5.0` are incompatible and lack `CreateSandbox`/`CloseSandbox`. Build both modules from the same source revision. Go module version selection does not validate a library loaded with `dlopen`.
 
-Example startup configuration:
+Example process creation configuration:
 
 ```json
 {
+  "operation": "create",
+  "process": 1,
   "guest": "/opt/llar/llar",
   "env": ["PATH=/usr/bin:/bin", "LANG=C"],
   "mounts": [
@@ -65,7 +67,7 @@ Example startup configuration:
 
 The backend requires an explicit list beginning with a `bind` or `tmpfs` root at `/`. The Go host supplies the default read-only `/` and guest `/proc` when its `Mounts` is empty. Bind sources must be absolute host directory paths. Targets are absolute guest paths; mounts are applied in order, and duplicate targets are rejected. Parent mounts and overlay layers must precede their users. Missing directory mountpoints use Sentry's synthetic-mountpoint support and require a writable parent mount; targets under a read-only parent must already exist.
 
-Registered types are `bind` (translated to gofer with DirectFS), `tmpfs`, `proc` and `overlay`. Common options are `ro`/`rw`, `noexec`/`exec`, `nosuid`/`suid` and `noatime`/`atime`, with the last option in a pair taking precedence. Tmpfs and overlay filesystem options are passed to Sentry as mount data; unsupported options fail. For overlay, `lowerdir` and `upperdir` refer to paths in the guest namespace, not host paths. An upper tmpfs makes changes temporary; use writable binds for persistent outputs. Mount namespaces, tmpfs contents and bind connections are released after the call, including partial setup failures.
+Registered types are `bind` (translated to gofer with DirectFS), `tmpfs`, `proc` and `overlay`. Common options are `ro`/`rw`, `noexec`/`exec`, `nosuid`/`suid` and `noatime`/`atime`, with the last option in a pair taking precedence. Tmpfs and overlay filesystem options are passed to Sentry as mount data; unsupported options fail. For overlay, `lowerdir` and `upperdir` refer to paths in the guest namespace, not host paths. An upper tmpfs makes changes temporary; use writable binds for persistent outputs. Mount namespaces, tmpfs contents and bind connections live until the process closes; partial setup failures also release them.
 
 The event's `mmap(context, address, size, memory)` callback allocates anonymous temporary guest pages using `MMap` and pins them. Address `0` requests `size` zeroed bytes without a source; a nonzero address initializes the pages using `CopyIn`. Sentry chooses a vacant guest address. The returned `syscall_memory` contains a host `data` pointer directly mapping those pages, their guest `address`, and the initialized `length`. The host and guest addresses need not match. Editing `data` immediately changes the temporary pages without changing the original guest bytes. There is no caller-owned staging buffer or write/commit callback; initialization from a source copies bytes and is not COW. Address-zero allocation requires `sentry/v0.3.0` or later; it is not supported by `sentry/v0.2.0`.
 
@@ -89,7 +91,13 @@ guest syscall
     -> next Context.Switch resumes the guest
 ```
 
-The hook is implemented in [platform_linux.go](platform_linux.go). It does not modify gVisor's sysmsg queues, futex handoff or kernel syscall implementations. [run_linux.go](run_linux.go) creates a new Sentry kernel/guest for each call; the Systrap platform is retained between calls.
+The hook is implemented in [platform_linux.go](platform_linux.go). It does not modify gVisor's sysmsg queues, futex handoff or kernel syscall implementations. [run_linux.go](run_linux.go) owns persistent guest processes within each Kernel. A completed run stops only its process; other guests remain runnable. The Systrap platform is retained between Kernels.
+
+## Process operations and idle memory
+
+`RunSandbox` dispatches `create`, `run` and `close` operations from the configuration JSON, keyed by `process` within its Kernel. Creation installs the guest entry and inspector. Run replaces fd 3 while the guest is paused, wakes it, exchanges a command/completion byte on fd 4 and waits for its tasks to stop again. Close interrupts active control I/O, terminates the process and waits for its threads, mappings and filesystem services to release. CloseSandbox closes all of its processes before releasing the Kernel. This operation protocol requires host and backend from the same source revision, even when an older backend exports the same C symbol names.
+
+Each process schedules idle eviction ten seconds after completing a run. A new run cancels the previous idle timer; timer callbacks verify their identity under the process lock so an old timer cannot evict a later call. The Kernel's application MemoryFile uses an unlinked temporary backing file. Eviction holds the selected memory manager's mapping lock, flushes existing private non-COW ranges, removes platform mappings and requests file-cache reclamation. It retains VMA/PMA and thread state, and never calls Decommit on live data. The ordinary fault path reloads pages after resume. The pinned gVisor dependency remains unchanged; `process_memory_linux.go` adapts its private mapping metadata using reflection and its existing methods. Host temporary storage must be disk-backed for this reclamation to work. This mechanism retains kernel/FD/VFS state and is not a standalone checkpoint.
 
 ## Runtime Conditions
 

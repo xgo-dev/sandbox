@@ -38,6 +38,9 @@ func main() {
 }
 
 func run() error {
+	if err := checkProcessLifecycle(); err != nil {
+		return fmt.Errorf("persistent process: %w", err)
+	}
 	if err := checkKernelLifecycle(); err != nil {
 		return fmt.Errorf("kernel lifecycle: %w", err)
 	}

@@ -12,9 +12,33 @@ func main() {
 }
 ```
 
-Guest startup is internal to the library. A new guest executes Go runtime and package initialization, then enters the imported closure without executing the application's `main`. Initialization side effects must be appropriate there. Captured objects must be exclusively owned until `Run` returns. The function must finish its own goroutines before returning. Concurrent and nested host calls are supported when their captured graphs are independent.
+Guest startup is internal to the library. A new guest executes Go runtime and package initialization, then enters the imported closure without executing the application's `main`. Initialization side effects must be appropriate there. Captured objects must be exclusively owned until `Run` returns. Goroutines must stop accessing captured objects before the callback returns; a persistent Process may retain goroutines that only use guest-owned state. Concurrent and nested host calls are supported when their captured graphs are independent.
 
-`sandbox.Run` uses one global default Sandbox, initialized on first use and retained for the host process lifetime. Each explicit `Sandbox` likewise starts its Kernel on its first `Run` and reuses it until `Close`. Every call creates a fresh guest process, PID namespace, filesystem namespace, FD table and snapshot, and transfers the complete type and object graph. Guest processes are not pooled. `Close` rejects new calls, terminates active guests and waits for their calls to finish; repeated `Close` calls are safe. Do not call it from that Sandbox's inspector. Do not copy a used Sandbox or change its fields while calls are active; `Library` must remain unchanged after first use.
+`sandbox.Run` uses one global default Sandbox, initialized on first use and retained for the host process lifetime. Each explicit `Sandbox` likewise reuses its Kernel until `Close`. These one-shot entry points create and close a fresh guest for each call. `Sandbox.Close` rejects new calls, terminates its guests and waits for active calls to finish. Do not call Close from the corresponding inspector, copy a used Sandbox, or change its configuration while calls are active; `Library` remains fixed after first use.
+
+## Persistent processes
+
+Use one Process when callbacks need the same native package globals, open guest files or filesystem state:
+
+```go
+p := sandbox.NewProcess(sandbox.ProcessOptions{
+    Env: os.Environ(),
+})
+defer p.Close()
+
+if err := p.Run(func() { f.OnRequire(proj, deps) }); err != nil {
+    return err
+}
+if err := p.Run(func() { f.OnBuild(ctx) }); err != nil {
+    return err
+}
+```
+
+`NewProcess` accepts zero or one `ProcessOptions` value. It uses the default shared Kernel and starts its guest on the first Run. Options contain `Mounts`, `Env` and `Inspect`; nil Env inherits the host environment at startup. The guest's environment and mounts then persist. Each successful Run writes captured changes back, pauses this process's guest tasks and leaves native global state in the guest. Calls on one Process execute serially; independent processes may run concurrently. Existing object IDs are retained across calls, including when a guest global keeps a pointer to a captured object. Close terminates the process and any active call, waits for cleanup, and is idempotent. Failed execution or a failed transfer closes the process; it is never silently restarted.
+
+After ten seconds idle, Sentry flushes eligible private pages and asks the host to reclaim their resident storage. The process, virtual mappings and kernel resources stay alive; subsequent accesses fault pages back at the same addresses. The application MemoryFile is backed by an unlinked temporary file. Place the host temporary directory on a disk filesystem for reclamation; a tmpfs-backed file cannot provide this disk-eviction behavior. Eviction failures are logged and do not discard guest data. Shared/COW mappings and Sentry's own management memory are retained. This is live-process page eviction, not a checkpoint that survives host shutdown.
+
+The eviction adapter reads the pinned gVisor version's private mapping metadata under its existing lock. It does not modify gVisor or parse diagnostic text. Each Run still uses a fresh memfd, and results remain write-sealed before host decoding. The one-shot `sandbox.Run(fn)` creates a Process, runs it and closes it automatically.
 
 ## Modules
 
@@ -81,8 +105,8 @@ err := s.Run(func() { f.OnBuild(ctx) })
 | Type | Source and lifetime |
 | --- | --- |
 | `bind` | Host directory, served through DirectFS. Writes persist in that host directory. Host permissions still apply. |
-| `tmpfs` | New Sentry filesystem for each call. Supports options such as `size`, `mode`, `uid` and `gid`; contents disappear when the call ends. |
-| `proc` | Process information from this call's PID namespace. |
+| `tmpfs` | New Sentry filesystem for each process. Supports options such as `size`, `mode`, `uid` and `gid`; contents persist until the process closes. |
+| `proc` | Process information from the guest's PID namespace. |
 | `overlay` | Combines already visible guest paths using `lowerdir` and optional `upperdir`. Writes go to the upper layer, whose filesystem determines persistence. |
 
 An empty `Mounts` retains the default read-only host `/` and guest `/proc`. A nonempty list replaces all defaults. Its first entry must mount `bind` or `tmpfs` at `/`; subsequent mounts are applied in order, so parents and overlay layers must precede their users. Duplicate targets and unsupported types return an error. Missing directory mountpoints are prepared through Sentry's synthetic-mountpoint support, which still requires a writable parent mount. For a read-only parent, prepare the target directory beforehand or place new mountpoints under a writable tmpfs. Bind sources currently must be directories.
